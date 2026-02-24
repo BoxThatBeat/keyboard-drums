@@ -1,0 +1,60 @@
+# keyboard-drums configuration
+#
+# Copy this file to ~/.config/keyboard-drums/config.toml and adjust to taste.
+# Find your keyboard device with: keyboard-drums --list-devices
+
+# Path to the evdev keyboard device (can be overridden with --device)
+device = "/dev/input/event3"
+
+# Master volume (0.0 to 1.0)
+master_volume = 0.8
+
+# Maximum simultaneous voices (oldest voice stolen when exceeded)
+max_voices = 32
+
+# Directory containing .wav sample files
+samples_dir = "/home/user/.config/keyboard-drums/samples"
+
+# Keybindings: map evdev key names to WAV samples
+# Key names match Linux input event codes (e.g. KEY_A, KEY_SPACE, KEY_SEMICOLON)
+# Gain is per-sample volume (0.0 to 1.0), defaults to 1.0 if omitted
+
+[[bindings]]
+key = "KEY_A"
+sample = "kick.wav"
+gain = 1.0
+
+[[bindings]]
+key = "KEY_S"
+sample = "snare.wav"
+gain = 0.9
+
+[[bindings]]
+key = "KEY_D"
+sample = "hihat_closed.wav"
+gain = 0.7
+
+[[bindings]]
+key = "KEY_F"
+sample = "hihat_open.wav"
+gain = 0.7
+
+[[bindings]]
+key = "KEY_J"
+sample = "tom_high.wav"
+gain = 0.85
+
+[[bindings]]
+key = "KEY_K"
+sample = "tom_low.wav"
+gain = 0.85
+
+[[bindings]]
+key = "KEY_L"
+sample = "crash.wav"
+gain = 0.6
+
+[[bindings]]
+key = "KEY_SEMICOLON"
+sample = "ride.wav"
+gain = 0.65

@@ -1,0 +1,38 @@
+[package]
+name = "keyboard-drums"
+version = "0.1.0"
+edition = "2024"
+description = "Ultra-low latency console drum sampler using keyboard input via evdev"
+
+[dependencies]
+# Keyboard input - direct evdev access for lowest latency
+evdev = "0.13"
+
+# Audio decoding - WAV file loading
+hound = "3.5"
+
+# Lock-free ring buffer - zero-contention trigger passing
+ringbuf = "0.4"
+
+# Audio output - ALSA/PipeWire backend
+cpal = "0.17"
+
+# Thread coordination - scoped threads
+crossbeam = "0.8"
+
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Config file parsing
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Signal handling (SIGHUP reload, SIGTERM shutdown)
+signal-hook = "0.4"
+
+# Error handling
+anyhow = "1.0"
