@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod input;
 mod ring;
 mod samples;
 
