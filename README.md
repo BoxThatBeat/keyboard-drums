@@ -184,10 +184,6 @@ Run with `--verbose` to see the key codes for any key you press.
 
 When the number of simultaneously playing samples exceeds `max_voices`, the oldest voices are silently removed to make room for new ones. This prevents audio glitches from too many overlapping sounds.
 
-## Device grabbing
-
-When keyboard-drums starts, it attempts to grab exclusive access to the input device. This means bound keypresses won't pass through to your terminal or desktop environment while the program is running. If the grab fails (e.g. insufficient permissions), it continues anyway -- keys will trigger samples but also reach the system as normal.
-
 ## Running as a service
 
 A systemd user service is included for running keyboard-drums in the background:

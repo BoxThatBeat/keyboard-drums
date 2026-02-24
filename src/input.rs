@@ -74,15 +74,9 @@ pub fn run_input_loop(
         key_map.len()
     );
 
-    // Grab the device so key events don't pass through to the system.
-    // This is optional — failing to grab is not fatal.
-    match device.grab() {
-        Ok(()) => log::info!("Grabbed exclusive access to input device"),
-        Err(e) => log::warn!(
-            "Could not grab exclusive device access (keys will pass through to system): {}",
-            e
-        ),
-    }
+    // Passive listening: we do NOT grab the device.
+    // Key events continue to pass through to other applications normally.
+    log::info!("Listening passively (key events still reach other applications)");
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -110,8 +104,6 @@ pub fn run_input_loop(
         }
     }
 
-    // Try to ungrab on exit.
-    let _ = device.ungrab();
     log::info!("Input reader stopped");
 
     Ok(())
@@ -153,9 +145,7 @@ fn handle_event(event: &InputEvent, key_map: &KeyMap, producer: &mut TriggerProd
 /// Build a KeyMap from the resolved config bindings.
 ///
 /// Maps evdev key code (u16) -> (sample_index, gain).
-pub fn build_key_map(
-    key_map: &HashMap<u16, crate::config::ResolvedBinding>,
-) -> KeyMap {
+pub fn build_key_map(key_map: &HashMap<u16, crate::config::ResolvedBinding>) -> KeyMap {
     key_map
         .iter()
         .map(|(&code, binding)| (code, (binding.sample_index, binding.gain)))
