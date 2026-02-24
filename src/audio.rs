@@ -11,6 +11,11 @@ const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 /// The number of output channels (stereo).
 const OUTPUT_CHANNELS: u16 = 2;
 
+/// Minimum buffer size in frames. The device-reported minimum can be as low
+/// as 1, which causes catastrophic CPU overhead (48k callbacks/sec). 64 frames
+/// at 48kHz ≈ 1.3ms — well within the latency budget and realistic for ALSA.
+const MIN_BUFFER_FRAMES: u32 = 64;
+
 /// A single active voice (playing sample instance).
 #[derive(Debug)]
 struct Voice {
@@ -151,11 +156,21 @@ fn find_best_config(device: &cpal::Device) -> Result<StreamConfig> {
          Check that your audio device supports 48kHz output.",
     )?;
 
-    // Request the smallest possible buffer size for lowest latency.
+    // Request a small buffer size for low latency, but enforce a sane floor.
+    // Device-reported minimums can be as low as 1 frame, which causes the
+    // callback to fire tens of thousands of times per second — overwhelming
+    // the CPU with scheduling overhead and producing no usable audio.
     let buffer_size = match supported_config.buffer_size() {
-        cpal::SupportedBufferSize::Range { min, .. } => {
-            log::info!("Audio device supports buffer range, requesting minimum: {} frames", min);
-            BufferSize::Fixed(*min)
+        cpal::SupportedBufferSize::Range { min, max } => {
+            let target = (*min).max(MIN_BUFFER_FRAMES).min(*max);
+            log::info!(
+                "Audio device buffer range: {}-{} frames, requesting {} frames ({:.1}ms)",
+                min,
+                max,
+                target,
+                target as f64 / OUTPUT_SAMPLE_RATE as f64 * 1000.0,
+            );
+            BufferSize::Fixed(target)
         }
         cpal::SupportedBufferSize::Unknown => {
             log::info!("Audio device buffer size unknown, using default");
@@ -258,7 +273,11 @@ fn audio_callback(
                 // Map output channel to source channel.
                 // Mono: duplicate to both channels.
                 // Stereo: direct mapping.
-                let src_ch = if sample_channels == 1 { 0 } else { ch.min(sample_channels - 1) };
+                let src_ch = if sample_channels == 1 {
+                    0
+                } else {
+                    ch.min(sample_channels - 1)
+                };
                 let src_idx = src_offset + src_ch;
 
                 if src_idx < sample.data.len() && dst_idx < data.len() {
@@ -590,7 +609,11 @@ mod tests {
         for frame in 0..5 {
             let l = output[frame * 2];
             let r = output[frame * 2 + 1];
-            assert_eq!(l, r, "Mono upmix: L and R should be equal at frame {}", frame);
+            assert_eq!(
+                l, r,
+                "Mono upmix: L and R should be equal at frame {}",
+                frame
+            );
             assert!(l > 0.0, "Expected non-zero output at frame {}", frame);
         }
     }
@@ -630,8 +653,14 @@ mod tests {
         );
 
         // Double trigger (two stacked voices).
-        prod_double.send(Trigger { sample_id: 0, velocity: 1.0 });
-        prod_double.send(Trigger { sample_id: 0, velocity: 1.0 });
+        prod_double.send(Trigger {
+            sample_id: 0,
+            velocity: 1.0,
+        });
+        prod_double.send(Trigger {
+            sample_id: 0,
+            velocity: 1.0,
+        });
         let mut out_double = vec![0.0f32; 20];
         let mut voices_double = Vec::with_capacity(32);
         let mut tb_double = Vec::with_capacity(128);
