@@ -1,0 +1,31 @@
+# keyboard-drums systemd user service
+#
+# Installation:
+#   mkdir -p ~/.config/systemd/user
+#   cp keyboard-drums.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable keyboard-drums
+#   systemctl --user start keyboard-drums
+#
+# Logs:
+#   journalctl --user -u keyboard-drums -f
+#
+# Reload config (SIGHUP):
+#   systemctl --user reload keyboard-drums
+
+[Unit]
+Description=keyboard-drums - Ultra-low latency console drum sampler
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/keyboard-drums --config %h/.config/keyboard-drums/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+
+# Audio needs access to the sound system
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+# keyboard-drums udev rule
+#
+# Grants read access to /dev/input/event* devices for members of the "input" group.
+# This allows keyboard-drums to read keyboard events without running as root.
+#
+# Installation:
+#   sudo cp 99-keyboard-drums.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# Then add your user to the input group:
+#   sudo usermod -aG input $USER
+#   (log out and back in for the group change to take effect)
+
+KERNEL=="event*", SUBSYSTEM=="input", MODE="0660", GROUP="input"
