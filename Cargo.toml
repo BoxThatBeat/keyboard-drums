@@ -36,3 +36,6 @@ signal-hook = "0.4"
 
 # Error handling
 anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
