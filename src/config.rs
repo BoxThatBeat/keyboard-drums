@@ -122,6 +122,16 @@ fn default_gain() -> f32 {
     1.0
 }
 
+/// Expand a leading `~` or `~/` to the user's home directory.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" || path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(&path[2..]);
+        }
+    }
+    PathBuf::from(path)
+}
+
 /// Resolve an optional evdev key name string to a key code.
 fn resolve_optional_key(name: &Option<String>, field: &str) -> Result<Option<u16>> {
     match name {
@@ -168,7 +178,7 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig> {
         config.max_voices
     };
 
-    let samples_dir = PathBuf::from(&config.samples_dir);
+    let samples_dir = expand_tilde(&config.samples_dir);
     if !samples_dir.is_dir() {
         bail!(
             "samples_dir does not exist or is not a directory: {}",
@@ -271,7 +281,9 @@ fn resolve_config(config: Config) -> Result<ResolvedConfig> {
     );
 
     Ok(ResolvedConfig {
-        device: config.device,
+        device: config
+            .device
+            .map(|d| expand_tilde(&d).to_string_lossy().into_owned()),
         master_volume,
         max_voices,
         samples_dir,

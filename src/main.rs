@@ -7,7 +7,6 @@ mod samples;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use clap::Parser;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -55,7 +54,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // Resolve config path (expand ~ to home dir).
-    let config_path = expand_tilde(&cli.config);
+    let config_path = config::expand_tilde(&cli.config);
     log::info!("Loading config from: {}", config_path.display());
 
     let mut resolved = config::load_config(&config_path)?;
@@ -177,14 +176,4 @@ fn run(cli: Cli) -> Result<()> {
     log::info!("keyboard-drums stopped.");
 
     Ok(())
-}
-
-/// Expand `~` at the start of a path to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(&path[2..]);
-        }
-    }
-    PathBuf::from(path)
 }

@@ -40,7 +40,7 @@ max_voices = 32
 # Each variant folder must contain all sample files referenced in bindings.
 # Kits and variants are sorted alphabetically. The first kit and first
 # variant are loaded on startup.
-samples_dir = "/home/user/.config/keyboard-drums/samples"
+samples_dir = "~/.config/keyboard-drums/samples"
 
 # Keys for cycling through drum kits and variants at runtime.
 # All keys are optional — omit any you don't need.
