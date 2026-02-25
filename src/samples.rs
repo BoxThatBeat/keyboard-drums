@@ -101,6 +101,10 @@ impl KitLibrary {
     }
 
     /// Load all samples for a given kit/variant into a SampleBank.
+    ///
+    /// Missing sample files are replaced with silent placeholders so that
+    /// variants with partial sample coverage still work — the missing
+    /// bindings simply produce no sound.
     pub fn load_bank(&self, kit_index: usize, variant_index: usize) -> Result<SampleBank> {
         let kit = self.kits.get(kit_index).context("Kit index out of range")?;
         let variant = kit
@@ -112,32 +116,62 @@ impl KitLibrary {
 
         let start = Instant::now();
         let mut samples = Vec::with_capacity(self.sample_names.len());
+        let mut loaded_count = 0usize;
 
         for (i, name) in self.sample_names.iter().enumerate() {
             let path = variant_dir.join(name);
-            log::debug!(
-                "Loading sample {} of {}: {}",
-                i + 1,
-                self.sample_names.len(),
-                path.display()
-            );
-            let sample = load_wav(&path).with_context(|| {
-                format!(
-                    "Failed to load sample '{}' from kit '{}' variant '{}'",
-                    name, kit.name, variant,
-                )
-            })?;
-            samples.push(Arc::new(sample));
+
+            if path.is_file() {
+                log::debug!(
+                    "Loading sample {} of {}: {}",
+                    i + 1,
+                    self.sample_names.len(),
+                    path.display()
+                );
+                let sample = load_wav(&path).with_context(|| {
+                    format!(
+                        "Failed to load sample '{}' from kit '{}' variant '{}'",
+                        name, kit.name, variant,
+                    )
+                })?;
+                samples.push(Arc::new(sample));
+                loaded_count += 1;
+            } else {
+                log::debug!(
+                    "Sample '{}' not found in kit '{}' variant '{}' — using silence",
+                    name,
+                    kit.name,
+                    variant,
+                );
+                samples.push(Arc::new(SampleData {
+                    data: vec![],
+                    channels: 1,
+                    sample_rate: OUTPUT_SAMPLE_RATE,
+                }));
+            }
         }
 
         let elapsed = start.elapsed();
-        log::info!(
-            "Loaded {} samples for kit '{}' variant '{}' in {:.1}ms",
-            samples.len(),
-            kit.name,
-            variant,
-            elapsed.as_secs_f64() * 1000.0,
-        );
+        let missing = self.sample_names.len() - loaded_count;
+        if missing > 0 {
+            log::info!(
+                "Loaded {}/{} samples for kit '{}' variant '{}' in {:.1}ms ({} silent)",
+                loaded_count,
+                self.sample_names.len(),
+                kit.name,
+                variant,
+                elapsed.as_secs_f64() * 1000.0,
+                missing,
+            );
+        } else {
+            log::info!(
+                "Loaded {} samples for kit '{}' variant '{}' in {:.1}ms",
+                loaded_count,
+                kit.name,
+                variant,
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        }
 
         Ok(SampleBank {
             samples,
@@ -199,24 +233,32 @@ pub fn discover_kits(
 
             let variant_name = ventry.file_name().to_string_lossy().to_string();
 
-            // Validate that all required sample files exist in this variant.
-            let mut all_present = true;
+            // Check which sample files are present in this variant.
+            // Variants are accepted even if some samples are missing —
+            // missing samples will be silent placeholders at load time.
+            let mut present_count = 0;
             for sample_name in sample_names {
                 let sample_path = vpath.join(sample_name);
-                if !sample_path.is_file() {
-                    log::warn!(
-                        "Skipping variant '{}/{}': missing sample '{}'",
+                if sample_path.is_file() {
+                    present_count += 1;
+                } else {
+                    log::info!(
+                        "Variant '{}/{}': missing sample '{}' (will be silent)",
                         kit_name,
                         variant_name,
                         sample_name,
                     );
-                    all_present = false;
-                    break;
                 }
             }
 
-            if all_present {
+            if present_count > 0 {
                 variants.push(variant_name);
+            } else {
+                log::warn!(
+                    "Skipping variant '{}/{}': no sample files found",
+                    kit_name,
+                    variant_name,
+                );
             }
         }
 
@@ -560,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_kits_skips_incomplete_variants() {
+    fn test_discover_kits_accepts_partial_variants() {
         let _ = env_logger::builder().is_test(true).try_init();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -573,8 +615,53 @@ mod tests {
         let sample_gains = vec![1.0, 0.9];
         let library = discover_kits(root, &sample_names, &sample_gains).unwrap();
 
+        // Both variants should be accepted — variant2 has partial coverage.
+        assert_eq!(library.kits.len(), 1);
+        assert_eq!(library.kits[0].variants, vec!["variant1", "variant2"]);
+    }
+
+    #[test]
+    fn test_discover_kits_skips_empty_variants() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // variant1 has samples, variant2 has no sample files at all.
+        setup_kit_dir(root, "acoustic", "variant1", &["kick.wav"]);
+        setup_kit_dir(root, "acoustic", "variant2", &[]);
+
+        let sample_names = vec!["kick.wav".to_string(), "snare.wav".to_string()];
+        let sample_gains = vec![1.0, 0.9];
+        let library = discover_kits(root, &sample_names, &sample_gains).unwrap();
+
         assert_eq!(library.kits.len(), 1);
         assert_eq!(library.kits[0].variants, vec!["variant1"]);
+    }
+
+    #[test]
+    fn test_load_bank_with_missing_sample() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Only provide kick.wav, not snare.wav.
+        setup_kit_dir(root, "acoustic", "variant1", &["kick.wav"]);
+
+        let sample_names = vec!["kick.wav".to_string(), "snare.wav".to_string()];
+        let sample_gains = vec![1.0, 0.8];
+        let library = discover_kits(root, &sample_names, &sample_gains).unwrap();
+
+        let bank = library.load_bank(0, 0).unwrap();
+
+        // Both slots should exist in the bank.
+        assert_eq!(bank.samples.len(), 2);
+
+        // kick.wav should have real data.
+        assert!(bank.samples[0].num_frames() > 0);
+
+        // snare.wav should be a silent placeholder (empty data).
+        assert_eq!(bank.samples[1].num_frames(), 0);
+        assert_eq!(bank.samples[1].data.len(), 0);
     }
 
     #[test]
