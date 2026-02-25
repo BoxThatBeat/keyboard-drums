@@ -37,7 +37,10 @@ pub fn create_trigger_channel() -> (TriggerProducer, TriggerConsumer) {
     let rb = HeapRb::<Trigger>::new(RING_BUFFER_SIZE);
     let (prod, cons) = rb.split();
 
-    log::info!("Created trigger ring buffer with {} slots", RING_BUFFER_SIZE);
+    log::info!(
+        "Created trigger ring buffer with {} slots",
+        RING_BUFFER_SIZE
+    );
 
     (
         TriggerProducer { inner: prod },

@@ -5,6 +5,7 @@ mod ring;
 mod samples;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,11 +16,7 @@ use std::sync::Arc;
 #[command(name = "keyboard-drums", version, about)]
 struct Cli {
     /// Path to config file.
-    #[arg(
-        short,
-        long,
-        default_value = "~/.config/keyboard-drums/config.toml"
-    )]
+    #[arg(short, long, default_value = "~/.config/keyboard-drums/config.toml")]
     config: String,
 
     /// Override the evdev device path from config.
@@ -77,17 +74,28 @@ fn run(cli: Cli) -> Result<()> {
         )?
         .clone();
 
-    // Preload samples.
-    let loaded_samples = samples::preload_samples(&resolved.sample_files)?;
-
-    // Build per-sample gain array for the audio engine.
-    // Index by sample_id, gain comes from config bindings.
-    let mut sample_gains = vec![1.0f32; loaded_samples.len()];
+    // Build per-sample gain array from config bindings.
+    let mut sample_gains = vec![1.0f32; resolved.sample_names.len()];
     for binding in resolved.key_map.values() {
         if binding.sample_index < sample_gains.len() {
             sample_gains[binding.sample_index] = binding.gain;
         }
     }
+
+    // Discover drum kits and variants in the samples directory.
+    let library =
+        samples::discover_kits(&resolved.samples_dir, &resolved.sample_names, &sample_gains)?;
+
+    // Load the initial sample bank (first kit, first variant).
+    let initial_bank = library.load_bank(0, 0)?;
+    log::info!(
+        "Initial kit: '{}' variant '{}'",
+        initial_bank.kit_name,
+        initial_bank.variant_name,
+    );
+
+    // Create the shared, atomically-swappable sample bank.
+    let sample_bank = Arc::new(ArcSwap::from_pointee(initial_bank));
 
     // Create trigger ring buffer.
     let (producer, consumer) = ring::create_trigger_channel();
@@ -108,10 +116,9 @@ fn run(cli: Cli) -> Result<()> {
 
     // Start the audio engine.
     let audio_config = audio::AudioEngineConfig {
-        samples: loaded_samples,
+        sample_bank: Arc::clone(&sample_bank),
         max_voices: resolved.max_voices,
         master_volume: resolved.master_volume,
-        sample_gains,
     };
 
     let _audio_stream = audio::start_audio_stream(audio_config, consumer)?;
@@ -125,9 +132,18 @@ fn run(cli: Cli) -> Result<()> {
 
     crossbeam::thread::scope(|s| {
         let shutdown_ref = &shutdown;
+        let cycling_keys = &resolved.cycling_keys;
 
         let input_handle = s.spawn(move |_| {
-            input::run_input_loop(device, &key_map, producer, shutdown_ref)
+            input::run_input_loop(
+                device,
+                &key_map,
+                producer,
+                shutdown_ref,
+                cycling_keys,
+                library,
+                sample_bank,
+            )
         });
 
         // Main thread: wait for shutdown signal.

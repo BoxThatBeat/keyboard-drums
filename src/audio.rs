@@ -1,6 +1,7 @@
 use crate::ring::{Trigger, TriggerConsumer};
-use crate::samples::SampleData;
+use crate::samples::{SampleBank, SampleData};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, StreamConfig};
 use std::sync::Arc;
@@ -27,28 +28,32 @@ struct Voice {
 
     /// Combined gain (per-sample gain * master volume * velocity).
     gain: f32,
+
+    /// Snapshot of the sample data for this voice.
+    /// Holds an Arc to the SampleBank that was active when this voice started,
+    /// so the sample data stays alive even if the bank is swapped mid-playback.
+    sample_data: Arc<SampleData>,
 }
 
 /// Configuration for the audio engine.
 pub struct AudioEngineConfig {
-    /// Preloaded sample data indexed by sample_id.
-    pub samples: Vec<Arc<SampleData>>,
+    /// Shared sample bank that can be swapped at runtime.
+    pub sample_bank: Arc<ArcSwap<SampleBank>>,
 
     /// Maximum number of simultaneous voices.
     pub max_voices: usize,
 
     /// Master volume (0.0 to 1.0).
     pub master_volume: f32,
-
-    /// Per-sample gain values indexed by sample_id.
-    /// Used in combination with trigger velocity and master volume.
-    pub sample_gains: Vec<f32>,
 }
 
 /// Start the audio output stream and return a handle to it.
 ///
 /// The stream will consume triggers from the ring buffer consumer
 /// and mix active voices into the audio output.
+///
+/// The `sample_bank` is read atomically each time a trigger is received,
+/// allowing runtime sample swapping without locks in the audio callback.
 ///
 /// Returns the cpal Stream handle. The stream plays until the handle is dropped.
 pub fn start_audio_stream(
@@ -76,10 +81,9 @@ pub fn start_audio_stream(
         stream_config.buffer_size,
     );
 
-    let samples = config.samples;
+    let sample_bank = config.sample_bank;
     let max_voices = config.max_voices;
     let master_volume = config.master_volume;
-    let sample_gains = config.sample_gains;
     let output_channels = stream_config.channels as usize;
 
     // Pre-allocate voice array and trigger drain buffer outside the callback.
@@ -97,8 +101,7 @@ pub fn start_audio_stream(
                     &mut consumer,
                     &mut trigger_buf,
                     &mut voices,
-                    &samples,
-                    &sample_gains,
+                    &sample_bank,
                     master_volume,
                     max_voices,
                 );
@@ -194,6 +197,9 @@ fn find_best_config(device: &cpal::Device) -> Result<StreamConfig> {
 /// - No locks/mutexes
 /// - No syscalls
 /// - No logging (except in rare error paths)
+///
+/// The `ArcSwap::load` is lock-free — it performs an atomic pointer read
+/// and increments a reference count. This is safe for real-time audio.
 #[inline]
 fn audio_callback(
     data: &mut [f32],
@@ -201,8 +207,7 @@ fn audio_callback(
     consumer: &mut TriggerConsumer,
     trigger_buf: &mut Vec<Trigger>,
     voices: &mut Vec<Voice>,
-    samples: &[Arc<SampleData>],
-    sample_gains: &[f32],
+    sample_bank: &Arc<ArcSwap<SampleBank>>,
     master_volume: f32,
     max_voices: usize,
 ) {
@@ -210,20 +215,28 @@ fn audio_callback(
     consumer.drain(trigger_buf);
 
     // 2. Spawn new voices for each trigger.
-    for trigger in trigger_buf.iter() {
-        let sid = trigger.sample_id as usize;
-        if sid >= samples.len() {
-            continue; // Invalid sample_id, skip.
+    if !trigger_buf.is_empty() {
+        // Load the current sample bank once per callback (atomic pointer read).
+        let bank = sample_bank.load();
+
+        for trigger in trigger_buf.iter() {
+            let sid = trigger.sample_id as usize;
+            if sid >= bank.samples.len() {
+                continue; // Invalid sample_id, skip.
+            }
+
+            let per_sample_gain = bank.sample_gains.get(sid).copied().unwrap_or(1.0);
+            let gain = per_sample_gain * trigger.velocity * master_volume;
+
+            voices.push(Voice {
+                sample_id: trigger.sample_id,
+                position: 0,
+                gain,
+                // Clone the Arc to the sample data so this voice keeps
+                // a reference even if the bank is swapped while playing.
+                sample_data: Arc::clone(&bank.samples[sid]),
+            });
         }
-
-        let per_sample_gain = sample_gains.get(sid).copied().unwrap_or(1.0);
-        let gain = per_sample_gain * trigger.velocity * master_volume;
-
-        voices.push(Voice {
-            sample_id: trigger.sample_id,
-            position: 0,
-            gain,
-        });
     }
 
     // 3. Voice stealing: if we exceed max_voices, remove the oldest voices.
@@ -239,18 +252,10 @@ fn audio_callback(
     // 5. Mix all active voices into the output buffer.
     let num_frames = data.len() / output_channels;
 
-    // We'll remove finished voices after mixing.
     let mut i = 0;
     while i < voices.len() {
         let voice = &mut voices[i];
-        let sid = voice.sample_id as usize;
-
-        if sid >= samples.len() {
-            voices.swap_remove(i);
-            continue;
-        }
-
-        let sample = &samples[sid];
+        let sample = &voice.sample_data;
         let sample_channels = sample.channels as usize;
         let sample_frames = sample.num_frames();
 
@@ -321,12 +326,34 @@ mod tests {
         })
     }
 
+    /// Create a SampleBank wrapped in ArcSwap for testing.
+    fn make_test_bank(samples: Vec<Arc<SampleData>>) -> Arc<ArcSwap<SampleBank>> {
+        let gains = vec![1.0f32; samples.len()];
+        Arc::new(ArcSwap::from_pointee(SampleBank {
+            samples,
+            sample_gains: gains,
+            kit_name: "test".to_string(),
+            variant_name: "v1".to_string(),
+        }))
+    }
+
+    fn make_test_bank_with_gains(
+        samples: Vec<Arc<SampleData>>,
+        gains: Vec<f32>,
+    ) -> Arc<ArcSwap<SampleBank>> {
+        Arc::new(ArcSwap::from_pointee(SampleBank {
+            samples,
+            sample_gains: gains,
+            kit_name: "test".to_string(),
+            variant_name: "v1".to_string(),
+        }))
+    }
+
     #[test]
     fn test_audio_callback_silence_when_no_triggers() {
         let _ = env_logger::builder().is_test(true).try_init();
         let (_prod, mut cons) = ring::create_trigger_channel();
-        let samples = vec![make_test_sample(100, 1)];
-        let sample_gains = vec![1.0];
+        let bank = make_test_bank(vec![make_test_sample(100, 1)]);
         let mut voices = Vec::with_capacity(32);
         let mut trigger_buf = Vec::with_capacity(128);
         let mut output = vec![0.5f32; 256]; // Pre-fill with non-zero to verify it's zeroed.
@@ -337,8 +364,7 @@ mod tests {
             &mut cons,
             &mut trigger_buf,
             &mut voices,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             32,
         );
@@ -353,8 +379,7 @@ mod tests {
     fn test_audio_callback_plays_triggered_sample() {
         let _ = env_logger::builder().is_test(true).try_init();
         let (mut prod, mut cons) = ring::create_trigger_channel();
-        let samples = vec![make_test_sample(100, 1)];
-        let sample_gains = vec![1.0];
+        let bank = make_test_bank(vec![make_test_sample(100, 1)]);
         let mut voices = Vec::with_capacity(32);
         let mut trigger_buf = Vec::with_capacity(128);
         let mut output = vec![0.0f32; 20]; // 10 frames stereo
@@ -371,14 +396,12 @@ mod tests {
             &mut cons,
             &mut trigger_buf,
             &mut voices,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             32,
         );
 
         // Output should have non-zero values (sample was mixed in).
-        // The first frame might be 0.0 (ramp starts at 0), but subsequent should be non-zero.
         let has_nonzero = output.iter().any(|&s| s != 0.0);
         assert!(has_nonzero, "Expected non-zero output after trigger");
     }
@@ -387,9 +410,7 @@ mod tests {
     fn test_voice_finishes_and_is_removed() {
         let _ = env_logger::builder().is_test(true).try_init();
         let (mut prod, mut cons) = ring::create_trigger_channel();
-        // Very short sample: 5 frames.
-        let samples = vec![make_test_sample(5, 1)];
-        let sample_gains = vec![1.0];
+        let bank = make_test_bank(vec![make_test_sample(5, 1)]);
         let mut voices = Vec::with_capacity(32);
         let mut trigger_buf = Vec::with_capacity(128);
 
@@ -406,8 +427,7 @@ mod tests {
             &mut cons,
             &mut trigger_buf,
             &mut voices,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             32,
         );
@@ -420,8 +440,7 @@ mod tests {
     fn test_voice_stealing() {
         let _ = env_logger::builder().is_test(true).try_init();
         let (mut prod, mut cons) = ring::create_trigger_channel();
-        let samples = vec![make_test_sample(1000, 1)]; // Long sample.
-        let sample_gains = vec![1.0];
+        let bank = make_test_bank(vec![make_test_sample(1000, 1)]);
         let mut voices = Vec::with_capacity(4);
         let mut trigger_buf = Vec::with_capacity(128);
         let max_voices = 2;
@@ -441,8 +460,7 @@ mod tests {
             &mut cons,
             &mut trigger_buf,
             &mut voices,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             max_voices,
         );
@@ -467,8 +485,7 @@ mod tests {
             channels: 1,
             sample_rate: 48000,
         });
-        let samples = vec![sample];
-        let sample_gains = vec![1.0];
+        let bank = make_test_bank(vec![sample]);
 
         // Full volume.
         prod_full.send(Trigger {
@@ -484,8 +501,7 @@ mod tests {
             &mut cons_full,
             &mut trigger_buf_full,
             &mut voices_full,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             32,
         );
@@ -504,8 +520,7 @@ mod tests {
             &mut cons_half,
             &mut trigger_buf_half,
             &mut voices_half,
-            &samples,
-            &sample_gains,
+            &bank,
             0.5,
             32,
         );
@@ -535,8 +550,7 @@ mod tests {
             channels: 1,
             sample_rate: 48000,
         });
-        let samples = vec![loud_sample];
-        let sample_gains = vec![1.0];
+        let bank = make_test_bank(vec![loud_sample]);
 
         // Send 3 triggers — they'll stack and sum to ~2.7.
         for _ in 0..3 {
@@ -555,8 +569,7 @@ mod tests {
             &mut cons,
             &mut trigger_buf,
             &mut voices,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             32,
         );
@@ -581,8 +594,7 @@ mod tests {
             channels: 1,
             sample_rate: 48000,
         });
-        let samples = vec![mono_sample];
-        let sample_gains = vec![1.0];
+        let bank = make_test_bank(vec![mono_sample]);
 
         prod.send(Trigger {
             sample_id: 0,
@@ -599,8 +611,7 @@ mod tests {
             &mut cons,
             &mut trigger_buf,
             &mut voices,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             32,
         );
@@ -629,8 +640,7 @@ mod tests {
             channels: 1,
             sample_rate: 48000,
         });
-        let samples = vec![sample];
-        let sample_gains = vec![1.0];
+        let bank = make_test_bank(vec![sample]);
 
         // Single trigger.
         prod_single.send(Trigger {
@@ -646,8 +656,7 @@ mod tests {
             &mut cons_single,
             &mut tb_single,
             &mut voices_single,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             32,
         );
@@ -670,8 +679,7 @@ mod tests {
             &mut cons_double,
             &mut tb_double,
             &mut voices_double,
-            &samples,
-            &sample_gains,
+            &bank,
             1.0,
             32,
         );
@@ -688,5 +696,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_bank_swap_mid_playback() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (mut prod, mut cons) = ring::create_trigger_channel();
+
+        // Start with a long sample.
+        let sample_a = Arc::new(SampleData {
+            data: vec![0.5; 1000],
+            channels: 1,
+            sample_rate: 48000,
+        });
+        let bank = Arc::new(ArcSwap::from_pointee(SampleBank {
+            samples: vec![sample_a],
+            sample_gains: vec![1.0],
+            kit_name: "kit_a".to_string(),
+            variant_name: "v1".to_string(),
+        }));
+
+        prod.send(Trigger {
+            sample_id: 0,
+            velocity: 1.0,
+        });
+
+        let mut voices = Vec::with_capacity(32);
+        let mut trigger_buf = Vec::with_capacity(128);
+
+        // First callback — voice starts playing sample_a.
+        let mut output1 = vec![0.0f32; 20];
+        audio_callback(
+            &mut output1,
+            2,
+            &mut cons,
+            &mut trigger_buf,
+            &mut voices,
+            &bank,
+            1.0,
+            32,
+        );
+        assert_eq!(voices.len(), 1, "Should have 1 playing voice");
+        let has_audio = output1.iter().any(|&s| s != 0.0);
+        assert!(has_audio, "Should produce audio");
+
+        // Swap to a completely different bank.
+        let sample_b = Arc::new(SampleData {
+            data: vec![0.9; 500],
+            channels: 1,
+            sample_rate: 48000,
+        });
+        bank.store(Arc::new(SampleBank {
+            samples: vec![sample_b],
+            sample_gains: vec![1.0],
+            kit_name: "kit_b".to_string(),
+            variant_name: "v1".to_string(),
+        }));
+
+        // Second callback — voice should still play sample_a (its Arc snapshot).
+        let mut output2 = vec![0.0f32; 20];
+        audio_callback(
+            &mut output2,
+            2,
+            &mut cons,
+            &mut trigger_buf,
+            &mut voices,
+            &bank,
+            1.0,
+            32,
+        );
+        assert_eq!(voices.len(), 1, "Voice should still be playing");
+
+        // The output should be from sample_a (0.5), not sample_b (0.9).
+        // With gain=1.0, the output value should be 0.5.
+        assert!(
+            (output2[0] - 0.5).abs() < 0.01,
+            "Voice should still play old sample after bank swap, got {}",
+            output2[0],
+        );
     }
 }

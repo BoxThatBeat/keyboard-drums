@@ -12,12 +12,49 @@ master_volume = 0.8
 # Maximum simultaneous voices (oldest voice stolen when exceeded)
 max_voices = 32
 
-# Directory containing .wav sample files
+# Root directory containing drum kit folders.
+#
+# Expected structure:
+#   samples_dir/
+#     <kit>/
+#       <variant>/
+#         kick.wav
+#         snare.wav
+#         ...
+#
+# Example:
+#   ~/.config/keyboard-drums/samples/
+#     acoustic/
+#       variant1/
+#         kick.wav
+#         snare.wav
+#       variant2/
+#         kick.wav
+#         snare.wav
+#     electronic/
+#       variant1/
+#         kick.wav
+#         snare.wav
+#
+# Each variant folder must contain all sample files referenced in bindings.
+# Kits and variants are sorted alphabetically. The first kit and first
+# variant are loaded on startup.
 samples_dir = "/home/user/.config/keyboard-drums/samples"
 
-# Keybindings: map evdev key names to WAV samples
-# Key names match Linux input event codes (e.g. KEY_A, KEY_SPACE, KEY_SEMICOLON)
-# Gain is per-sample volume (0.0 to 1.0), defaults to 1.0 if omitted
+# Keys for cycling through drum kits and variants at runtime.
+# All keys are optional — omit any you don't need.
+# Key names match Linux input event codes (e.g. KEY_RIGHT, KEY_UP).
+[cycling_keys]
+next_kit = "KEY_RIGHT"
+prev_kit = "KEY_LEFT"
+next_variant = "KEY_UP"
+prev_variant = "KEY_DOWN"
+
+# Keybindings: map evdev key names to sample filenames.
+#
+# The "sample" field is the WAV filename that must exist in every variant
+# folder. Key names match Linux input event codes (e.g. KEY_A, KEY_SPACE).
+# Gain is per-sample volume (0.0 to 1.0), defaults to 1.0 if omitted.
 
 [[bindings]]
 key = "KEY_A"

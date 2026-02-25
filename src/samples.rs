@@ -1,5 +1,5 @@
-use anyhow::{Context, Result, bail};
-use std::path::Path;
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,6 +37,234 @@ impl SampleData {
         }
         self.num_frames() as f64 / self.sample_rate as f64
     }
+}
+
+/// A collection of loaded samples that the audio thread reads atomically.
+/// Swapped in as a unit when the user cycles kits or variants.
+#[derive(Debug)]
+pub struct SampleBank {
+    /// Loaded sample data indexed by sample_id.
+    pub samples: Vec<Arc<SampleData>>,
+
+    /// Per-sample gain values indexed by sample_id.
+    pub sample_gains: Vec<f32>,
+
+    /// Name of the current kit (folder name).
+    pub kit_name: String,
+
+    /// Name of the current variant (folder name).
+    pub variant_name: String,
+}
+
+/// Discovered drum kit with its variants.
+#[derive(Debug, Clone)]
+pub struct KitInfo {
+    /// Kit folder name (e.g. "acoustic").
+    pub name: String,
+
+    /// Sorted variant folder names (e.g. ["variant1", "variant2"]).
+    pub variants: Vec<String>,
+}
+
+/// All discovered kits in the samples directory.
+#[derive(Debug, Clone)]
+pub struct KitLibrary {
+    /// Root samples directory.
+    pub samples_dir: PathBuf,
+
+    /// Discovered kits in sorted order.
+    pub kits: Vec<KitInfo>,
+
+    /// Sample filenames that bindings expect (e.g. ["kick.wav", "snare.wav"]).
+    pub sample_names: Vec<String>,
+
+    /// Per-sample gains from config bindings, indexed by sample_id.
+    pub sample_gains: Vec<f32>,
+}
+
+impl KitLibrary {
+    /// Get the number of kits.
+    pub fn kit_count(&self) -> usize {
+        self.kits.len()
+    }
+
+    /// Get the number of variants for a given kit index.
+    pub fn variant_count(&self, kit_index: usize) -> usize {
+        self.kits.get(kit_index).map_or(0, |k| k.variants.len())
+    }
+
+    /// Build the full path to a variant directory.
+    pub fn variant_path(&self, kit_index: usize, variant_index: usize) -> Option<PathBuf> {
+        let kit = self.kits.get(kit_index)?;
+        let variant = kit.variants.get(variant_index)?;
+        Some(self.samples_dir.join(&kit.name).join(variant))
+    }
+
+    /// Load all samples for a given kit/variant into a SampleBank.
+    pub fn load_bank(&self, kit_index: usize, variant_index: usize) -> Result<SampleBank> {
+        let kit = self.kits.get(kit_index).context("Kit index out of range")?;
+        let variant = kit
+            .variants
+            .get(variant_index)
+            .context("Variant index out of range")?;
+
+        let variant_dir = self.samples_dir.join(&kit.name).join(variant);
+
+        let start = Instant::now();
+        let mut samples = Vec::with_capacity(self.sample_names.len());
+
+        for (i, name) in self.sample_names.iter().enumerate() {
+            let path = variant_dir.join(name);
+            log::debug!(
+                "Loading sample {} of {}: {}",
+                i + 1,
+                self.sample_names.len(),
+                path.display()
+            );
+            let sample = load_wav(&path).with_context(|| {
+                format!(
+                    "Failed to load sample '{}' from kit '{}' variant '{}'",
+                    name, kit.name, variant,
+                )
+            })?;
+            samples.push(Arc::new(sample));
+        }
+
+        let elapsed = start.elapsed();
+        log::info!(
+            "Loaded {} samples for kit '{}' variant '{}' in {:.1}ms",
+            samples.len(),
+            kit.name,
+            variant,
+            elapsed.as_secs_f64() * 1000.0,
+        );
+
+        Ok(SampleBank {
+            samples,
+            sample_gains: self.sample_gains.clone(),
+            kit_name: kit.name.clone(),
+            variant_name: variant.clone(),
+        })
+    }
+}
+
+/// Discover all kits and variants in the samples directory.
+///
+/// Expected structure:
+/// ```text
+/// samples_dir/
+///   kit_name/
+///     variant_name/
+///       kick.wav
+///       snare.wav
+///       ...
+/// ```
+///
+/// Kits and variants are sorted alphabetically. Each variant must contain
+/// all of the sample files specified in `sample_names`.
+pub fn discover_kits(
+    samples_dir: &Path,
+    sample_names: &[String],
+    sample_gains: &[f32],
+) -> Result<KitLibrary> {
+    let mut kits: Vec<KitInfo> = Vec::new();
+
+    let entries = std::fs::read_dir(samples_dir).with_context(|| {
+        format!(
+            "Failed to read samples directory: {}",
+            samples_dir.display()
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let kit_name = entry.file_name().to_string_lossy().to_string();
+
+        // Find variants (subdirectories of this kit).
+        let mut variants: Vec<String> = Vec::new();
+        let variant_entries = std::fs::read_dir(&path)
+            .with_context(|| format!("Failed to read kit directory: {}", path.display()))?;
+
+        for ventry in variant_entries {
+            let ventry = ventry?;
+            let vpath = ventry.path();
+            if !vpath.is_dir() {
+                continue;
+            }
+
+            let variant_name = ventry.file_name().to_string_lossy().to_string();
+
+            // Validate that all required sample files exist in this variant.
+            let mut all_present = true;
+            for sample_name in sample_names {
+                let sample_path = vpath.join(sample_name);
+                if !sample_path.is_file() {
+                    log::warn!(
+                        "Skipping variant '{}/{}': missing sample '{}'",
+                        kit_name,
+                        variant_name,
+                        sample_name,
+                    );
+                    all_present = false;
+                    break;
+                }
+            }
+
+            if all_present {
+                variants.push(variant_name);
+            }
+        }
+
+        variants.sort();
+
+        if variants.is_empty() {
+            log::warn!("Skipping kit '{}': no valid variants found", kit_name,);
+            continue;
+        }
+
+        kits.push(KitInfo {
+            name: kit_name,
+            variants,
+        });
+    }
+
+    kits.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if kits.is_empty() {
+        bail!(
+            "No valid drum kits found in {}. Expected structure: \
+             samples_dir/<kit>/<variant>/<sample>.wav",
+            samples_dir.display(),
+        );
+    }
+
+    let total_variants: usize = kits.iter().map(|k| k.variants.len()).sum();
+    log::info!(
+        "Discovered {} kits with {} total variants in {}",
+        kits.len(),
+        total_variants,
+        samples_dir.display(),
+    );
+    for kit in &kits {
+        log::info!(
+            "  Kit '{}': {} variants ({:?})",
+            kit.name,
+            kit.variants.len(),
+            kit.variants,
+        );
+    }
+
+    Ok(KitLibrary {
+        samples_dir: samples_dir.to_path_buf(),
+        kits,
+        sample_names: sample_names.to_vec(),
+        sample_gains: sample_gains.to_vec(),
+    })
 }
 
 /// Load a single WAV file into a SampleData struct.
@@ -103,9 +331,7 @@ fn decode_samples(
             let max_val = (1u32 << (spec.bits_per_sample - 1)) as f32;
             let data: Vec<f32> = reader
                 .into_samples::<i32>()
-                .map(|s| {
-                    s.map(|v| v as f32 / max_val)
-                })
+                .map(|s| s.map(|v| v as f32 / max_val))
                 .collect::<std::result::Result<Vec<f32>, _>>()
                 .with_context(|| format!("Failed to decode samples from {}", path.display()))?;
             Ok(data)
@@ -114,35 +340,12 @@ fn decode_samples(
             let data: Vec<f32> = reader
                 .into_samples::<f32>()
                 .collect::<std::result::Result<Vec<f32>, _>>()
-                .with_context(|| format!("Failed to decode float samples from {}", path.display()))?;
+                .with_context(|| {
+                    format!("Failed to decode float samples from {}", path.display())
+                })?;
             Ok(data)
         }
     }
-}
-
-/// Preload all sample files into memory.
-///
-/// Returns a Vec of Arc<SampleData> indexed by sample_index (matching the
-/// order from ResolvedConfig::sample_files).
-pub fn preload_samples(sample_files: &[std::path::PathBuf]) -> Result<Vec<Arc<SampleData>>> {
-    let start = Instant::now();
-    let mut samples = Vec::with_capacity(sample_files.len());
-
-    for (i, path) in sample_files.iter().enumerate() {
-        log::debug!("Loading sample {} of {}: {}", i + 1, sample_files.len(), path.display());
-        let sample = load_wav(path)
-            .with_context(|| format!("Failed to load sample {}: {}", i, path.display()))?;
-        samples.push(Arc::new(sample));
-    }
-
-    let elapsed = start.elapsed();
-    log::info!(
-        "Preloaded {} samples in {:.1}ms",
-        samples.len(),
-        elapsed.as_secs_f64() * 1000.0,
-    );
-
-    Ok(samples)
 }
 
 #[cfg(test)]
@@ -157,7 +360,7 @@ mod tests {
         sample_rate: u32,
         bits_per_sample: u16,
         num_frames: usize,
-    ) -> std::path::PathBuf {
+    ) -> PathBuf {
         let path = dir.join(name);
         let spec = hound::WavSpec {
             channels,
@@ -184,7 +387,7 @@ mod tests {
         channels: u16,
         sample_rate: u32,
         num_frames: usize,
-    ) -> std::path::PathBuf {
+    ) -> PathBuf {
         let path = dir.join(name);
         let spec = hound::WavSpec {
             channels,
@@ -202,6 +405,15 @@ mod tests {
         }
         writer.finalize().unwrap();
         path
+    }
+
+    /// Helper to create a kit/variant directory structure with WAV files.
+    fn setup_kit_dir(root: &Path, kit_name: &str, variant_name: &str, sample_names: &[&str]) {
+        let variant_dir = root.join(kit_name).join(variant_name);
+        std::fs::create_dir_all(&variant_dir).unwrap();
+        for &name in sample_names {
+            create_test_wav(&variant_dir, name, 1, 48000, 16, 100);
+        }
     }
 
     #[test]
@@ -308,24 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn test_preload_multiple() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let dir = tempfile::tempdir().unwrap();
-
-        let path1 = create_test_wav(dir.path(), "a.wav", 1, 48000, 16, 100);
-        let path2 = create_test_wav(dir.path(), "b.wav", 2, 48000, 16, 200);
-
-        let paths = vec![path1, path2];
-        let samples = preload_samples(&paths).unwrap();
-
-        assert_eq!(samples.len(), 2);
-        assert_eq!(samples[0].channels, 1);
-        assert_eq!(samples[0].num_frames(), 100);
-        assert_eq!(samples[1].channels, 2);
-        assert_eq!(samples[1].num_frames(), 200);
-    }
-
-    #[test]
     fn test_nonexistent_file() {
         let _ = env_logger::builder().is_test(true).try_init();
         let result = load_wav(Path::new("/nonexistent/foo.wav"));
@@ -342,5 +536,98 @@ mod tests {
         assert_eq!(sample.num_frames(), 0);
         assert_eq!(sample.data.len(), 0);
         assert_eq!(sample.duration_secs(), 0.0);
+    }
+
+    #[test]
+    fn test_discover_kits() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        setup_kit_dir(root, "acoustic", "variant1", &["kick.wav", "snare.wav"]);
+        setup_kit_dir(root, "acoustic", "variant2", &["kick.wav", "snare.wav"]);
+        setup_kit_dir(root, "electric", "variant1", &["kick.wav", "snare.wav"]);
+
+        let sample_names = vec!["kick.wav".to_string(), "snare.wav".to_string()];
+        let sample_gains = vec![1.0, 0.9];
+        let library = discover_kits(root, &sample_names, &sample_gains).unwrap();
+
+        assert_eq!(library.kits.len(), 2);
+        assert_eq!(library.kits[0].name, "acoustic");
+        assert_eq!(library.kits[0].variants, vec!["variant1", "variant2"]);
+        assert_eq!(library.kits[1].name, "electric");
+        assert_eq!(library.kits[1].variants, vec!["variant1"]);
+    }
+
+    #[test]
+    fn test_discover_kits_skips_incomplete_variants() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // variant1 has both samples, variant2 only has kick.wav
+        setup_kit_dir(root, "acoustic", "variant1", &["kick.wav", "snare.wav"]);
+        setup_kit_dir(root, "acoustic", "variant2", &["kick.wav"]);
+
+        let sample_names = vec!["kick.wav".to_string(), "snare.wav".to_string()];
+        let sample_gains = vec![1.0, 0.9];
+        let library = discover_kits(root, &sample_names, &sample_gains).unwrap();
+
+        assert_eq!(library.kits.len(), 1);
+        assert_eq!(library.kits[0].variants, vec!["variant1"]);
+    }
+
+    #[test]
+    fn test_discover_kits_no_valid_kits() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let dir = tempfile::tempdir().unwrap();
+
+        let sample_names = vec!["kick.wav".to_string()];
+        let sample_gains = vec![1.0];
+        let result = discover_kits(dir.path(), &sample_names, &sample_gains);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No valid drum kits"));
+    }
+
+    #[test]
+    fn test_load_bank() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        setup_kit_dir(root, "acoustic", "variant1", &["kick.wav", "snare.wav"]);
+
+        let sample_names = vec!["kick.wav".to_string(), "snare.wav".to_string()];
+        let sample_gains = vec![1.0, 0.8];
+        let library = discover_kits(root, &sample_names, &sample_gains).unwrap();
+
+        let bank = library.load_bank(0, 0).unwrap();
+        assert_eq!(bank.samples.len(), 2);
+        assert_eq!(bank.sample_gains.len(), 2);
+        assert_eq!(bank.kit_name, "acoustic");
+        assert_eq!(bank.variant_name, "variant1");
+        assert!((bank.sample_gains[1] - 0.8).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_kit_library_variant_path() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        setup_kit_dir(root, "acoustic", "variant1", &["kick.wav"]);
+
+        let sample_names = vec!["kick.wav".to_string()];
+        let sample_gains = vec![1.0];
+        let library = discover_kits(root, &sample_names, &sample_gains).unwrap();
+
+        let path = library.variant_path(0, 0).unwrap();
+        assert_eq!(path, root.join("acoustic").join("variant1"));
+
+        assert!(library.variant_path(99, 0).is_none());
+        assert!(library.variant_path(0, 99).is_none());
     }
 }

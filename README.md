@@ -11,6 +11,8 @@ keyboard-drums runs two threads connected by a lock-free ring buffer:
 
 All samples are preloaded into memory at startup. The audio callback does zero heap allocations. This keeps trigger-to-sound latency as low as the audio buffer allows (typically 1-5ms).
 
+Samples are organized into **drum kits** with **variants**. You can cycle through kits and variants at runtime using configurable keybindings -- samples are swapped atomically so there is no interruption to audio.
+
 ## Requirements
 
 - Linux (uses evdev for input, ALSA or PipeWire for audio)
@@ -62,18 +64,34 @@ Log out and back in for the group change to take effect.
 
 ### 3. Prepare samples
 
-Create a directory for your WAV samples:
+Create the samples directory structure. Samples are organized into **kits** and **variants**:
 
-```sh
-mkdir -p ~/.config/keyboard-drums/samples
+```
+~/.config/keyboard-drums/samples/
+  acoustic/
+    variant1/
+      kick.wav
+      snare.wav
+      hihat.wav
+    variant2/
+      kick.wav
+      snare.wav
+      hihat.wav
+  electronic/
+    variant1/
+      kick.wav
+      snare.wav
+      hihat.wav
 ```
 
-Copy your `.wav` files there. Samples **must be 48kHz**. Mono and stereo are both supported. 16-bit, 24-bit integer, and 32-bit float formats all work.
+Every variant folder within a kit must contain the same set of WAV files (matching the filenames in your bindings config). The first kit (alphabetically) and first variant are loaded on startup.
+
+Samples **must be 48kHz**. Mono and stereo are both supported. 16-bit, 24-bit integer, and 32-bit float formats all work.
 
 If your samples are a different sample rate, convert them with ffmpeg:
 
 ```sh
-ffmpeg -i kick_44100.wav -ar 48000 ~/.config/keyboard-drums/samples/kick.wav
+ffmpeg -i kick_44100.wav -ar 48000 kick.wav
 ```
 
 ### 4. Create a config file
@@ -90,6 +108,12 @@ device = "/dev/input/event3"
 master_volume = 0.8
 max_voices = 32
 samples_dir = "/home/youruser/.config/keyboard-drums/samples"
+
+[cycling_keys]
+next_kit = "KEY_RIGHT"
+prev_kit = "KEY_LEFT"
+next_variant = "KEY_UP"
+prev_variant = "KEY_DOWN"
 
 [[bindings]]
 key = "KEY_A"
@@ -151,16 +175,28 @@ The config file is TOML. See `config.example.toml` for a fully documented exampl
 | `device`        | string   | *(none)*                                  | Path to evdev device (e.g. `/dev/input/event3`) |
 | `master_volume` | float    | `0.8`                                     | Global volume multiplier (0.0 to 1.0)          |
 | `max_voices`    | integer  | `32`                                      | Max simultaneous sounds (oldest is stolen)      |
-| `samples_dir`   | string   | *(required)*                              | Directory containing WAV files                  |
+| `samples_dir`   | string   | *(required)*                              | Root directory containing kit folders            |
 | `bindings`      | array    | *(required)*                              | Key-to-sample mappings (see below)              |
+| `cycling_keys`  | table    | *(all empty)*                             | Keys for cycling kits/variants (see below)      |
 
 Each `[[bindings]]` entry has:
 
 | Field    | Type   | Default | Description                                    |
 |----------|--------|---------|------------------------------------------------|
 | `key`    | string | *(required)* | Linux evdev key name (e.g. `KEY_A`, `KEY_SPACE`) |
-| `sample` | string | *(required)* | WAV filename relative to `samples_dir`          |
+| `sample` | string | *(required)* | WAV filename present in every variant folder    |
 | `gain`   | float  | `1.0`   | Per-sample volume (0.0 to 1.0)                  |
+
+The `[cycling_keys]` table (all fields optional):
+
+| Field           | Type   | Default | Description                                |
+|-----------------|--------|---------|--------------------------------------------|
+| `next_kit`      | string | *(none)* | Key to cycle forward through drum kits     |
+| `prev_kit`      | string | *(none)* | Key to cycle backward through drum kits    |
+| `next_variant`  | string | *(none)* | Key to cycle forward through variants      |
+| `prev_variant`  | string | *(none)* | Key to cycle backward through variants     |
+
+Cycling keys must not conflict with sample keybindings. When switching kits, the variant resets to the first one. Cycling wraps around in both directions.
 
 ### Key names
 
@@ -179,6 +215,22 @@ Key names follow the Linux input event code naming convention. Common examples:
 | `KEY_LEFTCTRL`   | Left Ctrl   |
 
 Run with `--verbose` to see the key codes for any key you press.
+
+## Drum kits and variants
+
+Samples are organized into a two-level directory structure under `samples_dir`:
+
+```
+samples_dir/<kit>/<variant>/<sample>.wav
+```
+
+- **Kits** are the top-level folders (e.g. `acoustic`, `electronic`). Sorted alphabetically.
+- **Variants** are subfolders within each kit (e.g. `variant1`, `variant2`). Sorted alphabetically.
+- Each variant must contain all WAV files referenced in `[[bindings]]`.
+- Variants missing any required sample are skipped with a warning.
+- Kits with no valid variants are skipped entirely.
+
+At startup, the first kit and first variant are loaded. Press the configured cycling keys to switch at runtime. The sample swap is atomic -- any currently playing voices will finish with their original samples while new triggers use the new ones.
 
 ## Voice stealing
 

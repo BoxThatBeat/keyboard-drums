@@ -37,5 +37,8 @@ signal-hook = "0.4"
 # Error handling
 anyhow = "1.0"
 
+# Lock-free atomic Arc swapping - runtime sample bank replacement
+arc-swap = "1.8"
+
 [dev-dependencies]
 tempfile = "3"
