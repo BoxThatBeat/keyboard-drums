@@ -128,6 +128,61 @@ pub fn list_devices() {
     println!("Tip: Use the path of your keyboard as the 'device' setting in config.toml");
 }
 
+/// Interactively prompt the user to pick an input device by number.
+///
+/// Shows a numbered list of available evdev devices and reads a choice
+/// from stdin. Returns the selected device path as a String.
+pub fn pick_device_interactive() -> Result<String> {
+    let mut devices: Vec<_> = evdev::enumerate().collect();
+
+    if devices.is_empty() {
+        anyhow::bail!(
+            "No input devices found. \
+             You may need to run as root or add your user to the 'input' group."
+        );
+    }
+
+    // Sort by path for stable ordering.
+    devices.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    println!("No device configured. Pick an input device:\n");
+    for (i, (path, device)) in devices.iter().enumerate() {
+        let name = device.name().unwrap_or("(unnamed)");
+        println!("  {:>3})  {:<28} {}", i + 1, path.display(), name);
+    }
+    println!();
+
+    loop {
+        eprint!("Enter device number [1-{}]: ", devices.len());
+
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("Failed to read from stdin")?;
+
+        let trimmed = line.trim();
+
+        // Handle EOF / empty input (e.g. piped stdin).
+        if trimmed.is_empty() {
+            anyhow::bail!("No device selected (empty input)");
+        }
+
+        if let Ok(n) = trimmed.parse::<usize>() {
+            if n >= 1 && n <= devices.len() {
+                let path = devices[n - 1].0.to_string_lossy().into_owned();
+                let name = devices[n - 1].1.name().unwrap_or("(unnamed)");
+                println!("Selected: {} ({})\n", path, name);
+                return Ok(path);
+            }
+        }
+
+        println!(
+            "  Invalid choice. Please enter a number between 1 and {}.",
+            devices.len()
+        );
+    }
+}
+
 /// Open an evdev device by path and validate it supports key events.
 pub fn open_device(path: &Path) -> Result<Device> {
     let device = Device::open(path)

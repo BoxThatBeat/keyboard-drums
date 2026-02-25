@@ -65,14 +65,12 @@ fn run(cli: Cli) -> Result<()> {
         resolved.device = Some(device.clone());
     }
 
-    let device_path = resolved
-        .device
-        .as_ref()
-        .context(
-            "No device specified. Set 'device' in config.toml or use --device. \
-             Use --list-devices to see available devices.",
-        )?
-        .clone();
+    // Determine device path: CLI flag > config file > interactive picker.
+    let device_path = if let Some(ref path) = resolved.device {
+        path.clone()
+    } else {
+        input::pick_device_interactive()?
+    };
 
     // Build per-sample gain array from config bindings.
     let mut sample_gains = vec![1.0f32; resolved.sample_names.len()];

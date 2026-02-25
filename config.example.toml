@@ -3,8 +3,9 @@
 # Copy this file to ~/.config/keyboard-drums/config.toml and adjust to taste.
 # Find your keyboard device with: keyboard-drums --list-devices
 
-# Path to the evdev keyboard device (can be overridden with --device)
-device = "/dev/input/event3"
+# Path to the evdev keyboard device (can be overridden with --device).
+# If omitted, you will be prompted to pick a device on startup.
+# device = "/dev/input/event3"
 
 # Master volume (0.0 to 1.0)
 master_volume = 0.8
