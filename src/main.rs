@@ -103,6 +103,13 @@ fn run(cli: Cli) -> Result<()> {
     // Build key map for the input thread.
     let key_map = input::build_key_map(&resolved.key_map);
 
+    // Build the set of keys to suppress (sample bindings + cycling keys).
+    let suppressed_keys = input::build_suppressed_keys(&key_map, &resolved.cycling_keys);
+    log::info!(
+        "Suppressing {} bound keys from reaching other applications",
+        suppressed_keys.len(),
+    );
+
     // Set up signal handlers.
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_signal = shutdown.clone();
@@ -126,6 +133,10 @@ fn run(cli: Cli) -> Result<()> {
     // Open the input device.
     let device = input::open_device(std::path::Path::new(&device_path))?;
 
+    // Create a virtual device mirroring the physical keyboard's capabilities
+    // to forward non-bound events (keys, mouse axes, etc.).
+    let virtual_device = input::create_virtual_device(&device)?;
+
     // Run input loop on a dedicated thread using crossbeam scoped threads.
     // This ensures the thread is joined before we exit.
     log::info!("keyboard-drums ready. Press bound keys to play samples.");
@@ -143,6 +154,8 @@ fn run(cli: Cli) -> Result<()> {
                 cycling_keys,
                 library,
                 sample_bank,
+                &suppressed_keys,
+                virtual_device,
             )
         });
 

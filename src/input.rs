@@ -3,14 +3,20 @@ use crate::ring::{Trigger, TriggerProducer};
 use crate::samples::{KitLibrary, SampleBank};
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use evdev::{Device, EventType, InputEvent};
+use evdev::uinput::VirtualDevice;
+use evdev::{AttributeSet, Device, EventType, InputEvent, KeyCode, UinputAbsSetup};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// A key binding mapping: evdev key code -> (sample_index, gain).
 pub type KeyMap = HashMap<u16, (usize, f32)>;
+
+/// The set of evdev key codes that should be suppressed (not forwarded to
+/// other applications). This includes both sample-bound keys and cycling keys.
+pub type SuppressedKeys = HashSet<u16>;
 
 /// Tracks the current kit and variant selection for cycling.
 struct KitState {
@@ -149,6 +155,10 @@ pub fn open_device(path: &Path) -> Result<Device> {
 /// This function blocks, reading events from the evdev device.
 /// It should be called from a dedicated thread.
 ///
+/// The physical device is grabbed exclusively so that bound key events
+/// do not reach other applications. All other key events are forwarded
+/// through a uinput virtual keyboard.
+///
 /// When a key-down event matches a binding in `key_map`, a Trigger is
 /// pushed to the ring buffer producer. When a cycling key is pressed,
 /// the sample bank is swapped atomically.
@@ -162,15 +172,20 @@ pub fn run_input_loop(
     cycling_keys: &ResolvedCyclingKeys,
     library: KitLibrary,
     sample_bank: Arc<ArcSwap<SampleBank>>,
+    suppressed_keys: &SuppressedKeys,
+    mut virtual_device: VirtualDevice,
 ) -> Result<()> {
     log::info!(
-        "Input reader started, listening for {} key bindings",
-        key_map.len()
+        "Input reader started, listening for {} key bindings ({} keys suppressed)",
+        key_map.len(),
+        suppressed_keys.len(),
     );
 
-    // Passive listening: we do NOT grab the device.
-    // Key events continue to pass through to other applications normally.
-    log::info!("Listening passively (key events still reach other applications)");
+    // Grab the device exclusively so key events don't reach other apps.
+    device
+        .grab()
+        .context("Failed to grab input device exclusively")?;
+    log::info!("Device grabbed exclusively — bound keys will not reach other applications");
 
     let mut kit_state = KitState {
         library,
@@ -179,6 +194,39 @@ pub fn run_input_loop(
         variant_index: 0,
     };
 
+    let result = run_event_loop(
+        &mut device,
+        key_map,
+        &mut producer,
+        shutdown,
+        cycling_keys,
+        &mut kit_state,
+        suppressed_keys,
+        &mut virtual_device,
+    );
+
+    // Always ungrab the device on exit so the keyboard works normally again.
+    if let Err(e) = device.ungrab() {
+        log::warn!("Failed to ungrab device: {}", e);
+    } else {
+        log::info!("Device ungrabbed");
+    }
+
+    result
+}
+
+/// Inner event loop, separated so that grab/ungrab cleanup is guaranteed
+/// in `run_input_loop` regardless of how this function exits.
+fn run_event_loop(
+    device: &mut Device,
+    key_map: &KeyMap,
+    producer: &mut TriggerProducer,
+    shutdown: &AtomicBool,
+    cycling_keys: &ResolvedCyclingKeys,
+    kit_state: &mut KitState,
+    suppressed_keys: &SuppressedKeys,
+    virtual_device: &mut VirtualDevice,
+) -> Result<()> {
     loop {
         if shutdown.load(Ordering::Relaxed) {
             log::info!("Input reader shutting down");
@@ -186,8 +234,8 @@ pub fn run_input_loop(
         }
 
         // fetch_events() blocks until events are available.
-        let events = match device.fetch_events() {
-            Ok(events) => events,
+        let events: Vec<InputEvent> = match device.fetch_events() {
+            Ok(events) => events.collect(),
             Err(e) => {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
@@ -200,14 +248,89 @@ pub fn run_input_loop(
             }
         };
 
-        for event in events {
-            handle_event(&event, key_map, &mut producer, cycling_keys, &mut kit_state);
+        // Process events and forward non-suppressed ones to the virtual device.
+        //
+        // Physical device events arrive in batches delimited by SYN_REPORT.
+        // A typical key-press batch looks like:
+        //   EV_MSC MSC_SCAN <scancode>
+        //   EV_KEY KEY_A 1
+        //   EV_SYN SYN_REPORT 0
+        //
+        // We must suppress the entire batch for bound keys (including the
+        // accompanying MSC_SCAN), otherwise orphaned non-KEY events cause
+        // spurious input on the virtual device.
+        //
+        // Strategy: collect each batch, then filter and forward.
+        let mut batch: Vec<InputEvent> = Vec::new();
+
+        for event in &events {
+            // Always run our handler for drum triggering / kit cycling.
+            handle_event(event, key_map, producer, cycling_keys, kit_state);
+
+            if event.event_type() == EventType::SYNCHRONIZATION {
+                // End of batch — filter and forward.
+                forward_batch(&batch, suppressed_keys, virtual_device);
+                batch.clear();
+            } else {
+                batch.push(*event);
+            }
+        }
+
+        // Flush any trailing events (shouldn't normally happen, but be safe).
+        if !batch.is_empty() {
+            forward_batch(&batch, suppressed_keys, virtual_device);
         }
     }
 
     log::info!("Input reader stopped");
 
     Ok(())
+}
+
+/// Filter and forward a single batch of events to the virtual device.
+///
+/// Removes KEY events for suppressed key codes. If removing those KEY
+/// events leaves only non-KEY "companion" events (like MSC_SCAN) with
+/// nothing meaningful to deliver, the entire batch is dropped to avoid
+/// sending orphaned events.
+fn forward_batch(
+    batch: &[InputEvent],
+    suppressed_keys: &SuppressedKeys,
+    virtual_device: &mut VirtualDevice,
+) {
+    if batch.is_empty() {
+        return;
+    }
+
+    // Partition: keep events that are NOT suppressed KEY events.
+    let forward: Vec<InputEvent> = batch
+        .iter()
+        .filter(|ev| !(ev.event_type() == EventType::KEY && suppressed_keys.contains(&ev.code())))
+        .copied()
+        .collect();
+
+    if forward.is_empty() {
+        // Entire batch was suppressed keys (+ possibly MSC_SCAN companions).
+        // Drop the whole batch — nothing meaningful to forward.
+        return;
+    }
+
+    // Check if any KEY events survived filtering. If none did, the batch
+    // contains only companion events (MSC_SCAN, etc.) for suppressed keys.
+    // Drop those too — they are meaningless without their KEY event.
+    let has_key_event = forward.iter().any(|ev| ev.event_type() == EventType::KEY);
+    let original_had_key = batch.iter().any(|ev| ev.event_type() == EventType::KEY);
+
+    if original_had_key && !has_key_event {
+        // All KEY events were suppressed; remaining events are just
+        // companions (MSC_SCAN). Drop the whole batch.
+        return;
+    }
+
+    // emit() writes the events + appends a SYN_REPORT.
+    if let Err(e) = virtual_device.emit(&forward) {
+        log::warn!("Failed to forward events to virtual device: {}", e);
+    }
 }
 
 /// Process a single input event. If it's a key-down matching a binding,
@@ -281,6 +404,96 @@ pub fn build_key_map(key_map: &HashMap<u16, crate::config::ResolvedBinding>) -> 
         .iter()
         .map(|(&code, binding)| (code, (binding.sample_index, binding.gain)))
         .collect()
+}
+
+/// Build the set of key codes that should be suppressed (not forwarded).
+///
+/// This includes all sample-bound keys and all cycling keys.
+pub fn build_suppressed_keys(
+    key_map: &KeyMap,
+    cycling_keys: &ResolvedCyclingKeys,
+) -> SuppressedKeys {
+    let mut suppressed = SuppressedKeys::new();
+
+    // Add all sample-bound keys.
+    for &code in key_map.keys() {
+        suppressed.insert(code);
+    }
+
+    // Add all configured cycling keys.
+    if let Some(code) = cycling_keys.next_kit {
+        suppressed.insert(code);
+    }
+    if let Some(code) = cycling_keys.prev_kit {
+        suppressed.insert(code);
+    }
+    if let Some(code) = cycling_keys.next_variant {
+        suppressed.insert(code);
+    }
+    if let Some(code) = cycling_keys.prev_variant {
+        suppressed.insert(code);
+    }
+
+    suppressed
+}
+
+/// Create a uinput virtual device that mirrors ALL capabilities of the
+/// physical device. Since we grab the physical device exclusively, the
+/// virtual device must be able to emit every event type the physical one
+/// can, so that non-suppressed events (including any relative/absolute
+/// axes, switches, LEDs, etc.) are forwarded transparently.
+pub fn create_virtual_device(device: &Device) -> Result<VirtualDevice> {
+    let mut builder = VirtualDevice::builder()
+        .map_err(|e| anyhow::anyhow!("Failed to open /dev/uinput: {}", e))?
+        .name(b"keyboard-drums passthrough");
+
+    // Mirror key capabilities.
+    if let Some(keys) = device.supported_keys() {
+        let mut key_set = AttributeSet::<KeyCode>::new();
+        for key in keys.iter() {
+            key_set.insert(key);
+        }
+        builder = builder
+            .with_keys(&key_set)
+            .map_err(|e| anyhow::anyhow!("Failed to set virtual device keys: {}", e))?;
+    }
+
+    // Mirror relative axis capabilities (mouse movement, scroll wheel, etc.).
+    if let Some(rel_axes) = device.supported_relative_axes() {
+        builder = builder
+            .with_relative_axes(rel_axes)
+            .map_err(|e| anyhow::anyhow!("Failed to set virtual device relative axes: {}", e))?;
+    }
+
+    // Mirror absolute axis capabilities (touchpad, etc.).
+    if let Ok(absinfo_iter) = device.get_absinfo() {
+        for (axis_code, abs_info) in absinfo_iter {
+            let setup = UinputAbsSetup::new(axis_code, abs_info);
+            builder = builder.with_absolute_axis(&setup).map_err(|e| {
+                anyhow::anyhow!("Failed to set virtual device absolute axis: {}", e)
+            })?;
+        }
+    }
+
+    // Mirror switch capabilities.
+    if let Some(switches) = device.supported_switches() {
+        builder = builder
+            .with_switches(switches)
+            .map_err(|e| anyhow::anyhow!("Failed to set virtual device switches: {}", e))?;
+    }
+
+    // Mirror LED capabilities.
+    // Note: VirtualDeviceBuilder doesn't have with_leds(), so LEDs are
+    // not mirrored. This is acceptable — LED state is managed by the
+    // kernel and doesn't affect input forwarding.
+
+    let virt = builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create virtual device: {}", e))?;
+
+    log::info!("Created virtual device mirroring physical device capabilities");
+
+    Ok(virt)
 }
 
 #[cfg(test)]
@@ -487,5 +700,47 @@ mod tests {
         let mut buf = Vec::new();
         cons.drain(&mut buf);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_build_suppressed_keys_includes_bindings_and_cycling() {
+        let mut key_map = KeyMap::new();
+        key_map.insert(30, (0, 1.0)); // KEY_A
+        key_map.insert(31, (1, 0.9)); // KEY_S
+
+        let cycling = ResolvedCyclingKeys {
+            next_kit: Some(106),     // KEY_RIGHT
+            prev_kit: Some(105),     // KEY_LEFT
+            next_variant: Some(103), // KEY_UP
+            prev_variant: None,
+        };
+
+        let suppressed = build_suppressed_keys(&key_map, &cycling);
+
+        // Should contain both sample keys.
+        assert!(suppressed.contains(&30));
+        assert!(suppressed.contains(&31));
+
+        // Should contain configured cycling keys.
+        assert!(suppressed.contains(&106));
+        assert!(suppressed.contains(&105));
+        assert!(suppressed.contains(&103));
+
+        // Should NOT contain unconfigured cycling key.
+        // Total: 2 sample keys + 3 cycling keys = 5.
+        assert_eq!(suppressed.len(), 5);
+    }
+
+    #[test]
+    fn test_build_suppressed_keys_empty_cycling() {
+        let mut key_map = KeyMap::new();
+        key_map.insert(30, (0, 1.0));
+
+        let cycling = make_dummy_cycling_keys(); // all None
+
+        let suppressed = build_suppressed_keys(&key_map, &cycling);
+
+        assert_eq!(suppressed.len(), 1);
+        assert!(suppressed.contains(&30));
     }
 }
