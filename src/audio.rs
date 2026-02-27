@@ -219,7 +219,25 @@ fn audio_callback(
         // Load the current sample bank once per callback (atomic pointer read).
         let bank = sample_bank.load();
 
+        // Voice stealing: free up slots for incoming triggers by removing
+        // the oldest voices in a single drain() call. The old code used
+        // `while voices.len() > max { voices.remove(0) }` which was O(k*n)
+        // (each remove shifts all elements) and caused audio callback
+        // overruns under sustained playing.
+        let available = max_voices.saturating_sub(voices.len());
+        if trigger_buf.len() > available && !voices.is_empty() {
+            let to_steal = (trigger_buf.len() - available).min(voices.len());
+            voices.drain(..to_steal);
+        }
+
+        // Track how many voices we can still add without exceeding max_voices.
+        let mut slots_remaining = max_voices.saturating_sub(voices.len());
+
         for trigger in trigger_buf.iter() {
+            if slots_remaining == 0 {
+                break;
+            }
+
             let sid = trigger.sample_id as usize;
             if sid >= bank.samples.len() {
                 continue; // Invalid sample_id, skip.
@@ -236,20 +254,17 @@ fn audio_callback(
                 // a reference even if the bank is swapped while playing.
                 sample_data: Arc::clone(&bank.samples[sid]),
             });
+
+            slots_remaining -= 1;
         }
     }
 
-    // 3. Voice stealing: if we exceed max_voices, remove the oldest voices.
-    while voices.len() > max_voices {
-        voices.remove(0); // Remove oldest (front of the vec).
-    }
-
-    // 4. Zero the output buffer.
+    // 3. Zero the output buffer.
     for sample in data.iter_mut() {
         *sample = 0.0;
     }
 
-    // 5. Mix all active voices into the output buffer.
+    // 4. Mix all active voices into the output buffer.
     let num_frames = data.len() / output_channels;
 
     let mut i = 0;
@@ -301,7 +316,7 @@ fn audio_callback(
         }
     }
 
-    // 6. Clamp output to [-1.0, 1.0] to prevent clipping.
+    // 5. Clamp output to [-1.0, 1.0] to prevent clipping.
     for sample in data.iter_mut() {
         *sample = sample.clamp(-1.0, 1.0);
     }

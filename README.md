@@ -46,21 +46,38 @@ This prints all available evdev input devices. Look for your keyboard -- it's us
 
 ### 2. Set up permissions
 
-By default, `/dev/input/event*` devices require root access. To run as a normal user, add yourself to the `input` group:
+Two devices need to be accessible: `/dev/input/event*` (to read keyboard events) and `/dev/uinput` (to create a virtual keyboard that forwards non-drum keys to other applications).
+
+**Add yourself to the required groups:**
 
 ```sh
 sudo usermod -aG input $USER
+sudo groupadd -f uinput
+sudo usermod -aG uinput $USER
 ```
 
-Then install the udev rule to grant the `input` group read access:
+**Install the udev rules:**
 
 ```sh
 sudo cp udev/99-keyboard-drums.rules /etc/udev/rules.d/
+echo 'KERNEL=="uinput", MODE="0660", GROUP="uinput"' | sudo tee /etc/udev/rules.d/99-uinput.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-Log out and back in for the group change to take effect.
+**Ensure the uinput kernel module is loaded:**
+
+```sh
+sudo modprobe uinput
+```
+
+To load it automatically on boot:
+
+```sh
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf
+```
+
+Log out and back in for the group changes to take effect.
 
 ### 3. Prepare samples
 
