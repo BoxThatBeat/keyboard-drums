@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, StreamConfig};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// The output sample rate in Hz.
@@ -13,9 +14,12 @@ const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 const OUTPUT_CHANNELS: u16 = 2;
 
 /// Minimum buffer size in frames. The device-reported minimum can be as low
-/// as 1, which causes catastrophic CPU overhead (48k callbacks/sec). 64 frames
-/// at 48kHz ≈ 1.3ms — well within the latency budget and realistic for ALSA.
-const MIN_BUFFER_FRAMES: u32 = 64;
+/// as 1, which causes catastrophic CPU overhead (48k callbacks/sec). 256 frames
+/// at 48kHz ≈ 5.3ms — still well within acceptable latency for a drum pad and
+/// realistic for ALSA/PipeWire without a realtime kernel. The previous value
+/// of 64 (1.3ms) was too aggressive and caused constant buffer underruns on
+/// most systems because the OS scheduler couldn't guarantee sub-2ms wake-ups.
+const MIN_BUFFER_FRAMES: u32 = 256;
 
 /// A single active voice (playing sample instance).
 #[derive(Debug)]
@@ -106,8 +110,21 @@ pub fn start_audio_stream(
                     max_voices,
                 );
             },
-            move |err| {
-                log::error!("Audio stream error: {}", err);
+            {
+                // Throttle error logging to avoid spamming the log when underruns
+                // occur in bursts. Only log every Nth error, with a count summary.
+                let error_count = Arc::new(AtomicU64::new(0));
+                move |err| {
+                    let count = error_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    // Log the first error, then every 100th after that.
+                    if count == 1 || count % 100 == 0 {
+                        log::error!(
+                            "Audio stream error (#{count}): {err}. \
+                             If this persists, try increasing MIN_BUFFER_FRAMES \
+                             or check system audio load.",
+                        );
+                    }
+                }
             },
             None, // No timeout
         )
@@ -281,27 +298,51 @@ fn audio_callback(
 
         let gain = voice.gain;
         let frames_to_mix = num_frames.min(sample_frames - voice.position);
+        let src_data = &sample.data;
 
-        // Mix sample data into the output buffer.
-        for frame in 0..frames_to_mix {
-            let src_frame = voice.position + frame;
-            let src_offset = src_frame * sample_channels;
+        // Specialized tight loops for the common mono->stereo and stereo->stereo
+        // cases. These eliminate per-sample branch overhead (channel mapping checks
+        // and bounds checks) which was a significant contributor to callback overruns.
+        if sample_channels == 1 && output_channels == 2 {
+            // Mono source -> stereo output: duplicate each sample to L and R.
+            let src_start = voice.position;
+            for frame in 0..frames_to_mix {
+                let s = unsafe { *src_data.get_unchecked(src_start + frame) } * gain;
+                let dst = frame * 2;
+                unsafe {
+                    *data.get_unchecked_mut(dst) += s;
+                    *data.get_unchecked_mut(dst + 1) += s;
+                }
+            }
+        } else if sample_channels == 2 && output_channels == 2 {
+            // Stereo source -> stereo output: direct copy.
+            let src_start = voice.position * 2;
+            for frame in 0..frames_to_mix {
+                let src = src_start + frame * 2;
+                let dst = frame * 2;
+                unsafe {
+                    *data.get_unchecked_mut(dst) += *src_data.get_unchecked(src) * gain;
+                    *data.get_unchecked_mut(dst + 1) += *src_data.get_unchecked(src + 1) * gain;
+                }
+            }
+        } else {
+            // Generic fallback for unusual channel configurations.
+            for frame in 0..frames_to_mix {
+                let src_frame = voice.position + frame;
+                let src_offset = src_frame * sample_channels;
 
-            for ch in 0..output_channels {
-                let dst_idx = frame * output_channels + ch;
+                for ch in 0..output_channels {
+                    let dst_idx = frame * output_channels + ch;
+                    let src_ch = if sample_channels == 1 {
+                        0
+                    } else {
+                        ch.min(sample_channels - 1)
+                    };
+                    let src_idx = src_offset + src_ch;
 
-                // Map output channel to source channel.
-                // Mono: duplicate to both channels.
-                // Stereo: direct mapping.
-                let src_ch = if sample_channels == 1 {
-                    0
-                } else {
-                    ch.min(sample_channels - 1)
-                };
-                let src_idx = src_offset + src_ch;
-
-                if src_idx < sample.data.len() && dst_idx < data.len() {
-                    data[dst_idx] += sample.data[src_idx] * gain;
+                    if src_idx < src_data.len() && dst_idx < data.len() {
+                        data[dst_idx] += src_data[src_idx] * gain;
+                    }
                 }
             }
         }
