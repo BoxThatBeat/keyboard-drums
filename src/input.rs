@@ -236,11 +236,26 @@ pub fn run_input_loop(
         suppressed_keys.len(),
     );
 
+    // Give the kernel time to fully register the virtual device with the
+    // input subsystem before we grab the physical device. Without this
+    // delay, events forwarded immediately after the grab can be lost or
+    // misrouted, and any keys physically held during the grab window may
+    // become "stuck" on the virtual device (e.g. auto-repeating Enter).
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    log::info!("Virtual device registered, grabbing physical device");
+
     // Grab the device exclusively so key events don't reach other apps.
     device
         .grab()
         .context("Failed to grab input device exclusively")?;
     log::info!("Device grabbed exclusively — bound keys will not reach other applications");
+
+    // Synthesize key-up events on the virtual device for every key that
+    // was physically held at the moment we grabbed. Without this, the
+    // kernel thinks those keys are still pressed on the virtual device
+    // and auto-repeat fires indefinitely (manifesting as e.g. Enter
+    // being "pressed" over and over, flooding the terminal with newlines).
+    release_held_keys(&device, &mut virtual_device);
 
     let mut kit_state = KitState {
         library,
@@ -260,6 +275,11 @@ pub fn run_input_loop(
         &mut virtual_device,
     );
 
+    // Release any keys held on the virtual device before ungrabbing,
+    // to prevent stuck keys in the reverse direction (user holding a key
+    // while keyboard-drums shuts down).
+    release_held_keys(&device, &mut virtual_device);
+
     // Always ungrab the device on exit so the keyboard works normally again.
     if let Err(e) = device.ungrab() {
         log::warn!("Failed to ungrab device: {}", e);
@@ -268,6 +288,42 @@ pub fn run_input_loop(
     }
 
     result
+}
+
+/// Synthesize key-up events on the virtual device for every key that is
+/// currently reported as "pressed" on the physical device.
+///
+/// When we grab the physical device, the kernel stops delivering its
+/// events to other consumers. But any keys that were already held down
+/// at that instant remain in the "pressed" state from the perspective of
+/// the rest of the input stack — the key-up was never forwarded. The
+/// kernel's software auto-repeat then fires indefinitely for those keys
+/// on the virtual device, producing phantom key presses (most commonly
+/// Enter, since users press Enter to launch the program).
+fn release_held_keys(device: &Device, virtual_device: &mut VirtualDevice) {
+    match device.get_key_state() {
+        Ok(key_state) => {
+            let mut released = 0u32;
+            for key in key_state.iter() {
+                let up_event = InputEvent::new(EventType::KEY.0, key.code(), 0);
+                if let Err(e) = virtual_device.emit(&[up_event]) {
+                    log::warn!("Failed to release key {:?} on virtual device: {}", key, e);
+                } else {
+                    released += 1;
+                    log::debug!("Released held key {:?} on virtual device", key);
+                }
+            }
+            if released > 0 {
+                log::info!(
+                    "Released {} held key(s) on virtual device to prevent stuck keys",
+                    released,
+                );
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to read key state from device: {}", e);
+        }
+    }
 }
 
 /// Inner event loop, separated so that grab/ungrab cleanup is guaranteed
